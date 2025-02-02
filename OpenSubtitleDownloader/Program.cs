@@ -45,7 +45,8 @@ var login = await service.LoginAsync(new() { Username = username, Password = pas
 
 var featureSearch = new NewFeatureSearch
 {
-    Query = "The Big Bang Theory"
+    Query = "Mayday",
+    Year = 2003
 };
 
 var featureResult = await service.SearchFeaturesAsync(featureSearch);
@@ -169,10 +170,11 @@ if (!Directory.Exists(downloadDirPath))
 }
 
 var quotaExceeded = false;
+var useSeasonSubDirs = false;
 foreach (var season in subtitleFiles.Keys)
 {
     var targetSeasonDirPath = Path.Combine(downloadDirPath, $"Season {season:D2}");
-    if (!Directory.Exists(targetSeasonDirPath))
+    if (useSeasonSubDirs && !Directory.Exists(targetSeasonDirPath))
     {
         Directory.CreateDirectory(targetSeasonDirPath);
     }
@@ -181,7 +183,9 @@ foreach (var season in subtitleFiles.Keys)
     foreach (var file in seasonFiles)
     {
         var targetFileName = $"{file.ShowName} - S{file.SeasonNumber:D2}E{file.EpisodeNumber:D2}.srt";
-        var targetFilePath = Path.Combine(targetSeasonDirPath, targetFileName);
+        var targetFilePath = useSeasonSubDirs
+            ? Path.Combine(targetSeasonDirPath, targetFileName)
+            : Path.Combine(downloadDirPath, targetFileName);
 
         if (Path.Exists(targetFilePath))
         {
@@ -227,8 +231,6 @@ foreach (var season in subtitleFiles.Keys)
     }
 }
 
-logger.LogInformation("Downloads complete! Press ENTER to exit.");
-
-Console.ReadLine();
+logger.LogInformation("Downloads complete!");
 
 record SubtitleFile(string ShowName, int SeasonNumber, int EpisodeNumber, MovieCollection.OpenSubtitles.Models.SubtitleFile File);
