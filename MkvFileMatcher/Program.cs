@@ -1,8 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
-using Microsoft.ML;
-using Microsoft.ML.Data;
 using Whisper.net;
 using Whisper.net.Ggml;
 using Whisper.net.Logger;
@@ -34,6 +32,7 @@ if (!Directory.Exists(subtitlesFolder))
 // Print out what runtime Whisper is using
 Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
 
+// TODO: Change to use globbing via Matcher
 foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
 {
     Console.WriteLine($"Processing: {Path.GetFileName(filePath)}");
@@ -46,7 +45,7 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
     var transcription = await TranscribeAudio(audioPath);
 
     // Step 3: Match transcription with subtitle files using ML.NET
-    var bestMatch = FindBestMatchingSubtitleWithML(showName, season, transcription, subtitlesFolder);
+    var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitlesFolder);
 
     if (bestMatch != null)
     {
@@ -174,63 +173,65 @@ static async Task DownloadModel(string fileName, GgmlType ggmlType)
     await modelStream.CopyToAsync(fileWriter);
 }
 
-static string? FindBestMatchingSubtitleWithML(string showName, int season, string transcription, string subtitlesFolder)
+static string? FindBestMatchingSubtitle(string showName, int season, string transcription, string subtitlesFolder)
 {
-    // Load subtitles into ML.NET data view
-    var mlContext = new MLContext();
     var fileNamePrefix = $"{showName} - S{season:D2}";
+    // TODO: Change to use globbing via Matcher
     var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
         .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
         .ToArray();
-    var subtitleFiles = srtFiles.Select(file => new SubtitleData
-    {
-        FilePath = file,
-        Content = File.ReadAllText(file)
-    }).ToList();
 
-    // TODO: Remove the timestamps from the subtitle content
-
-    var dataView = mlContext.Data.LoadFromEnumerable(subtitleFiles);
-
-    // Define pipeline
-    var pipeline = mlContext.Transforms.Text.FeaturizeText("Features", nameof(SubtitleData.Content))
-        .Append(mlContext.Transforms.Concatenate("Features", "Features"))
-        .Append(mlContext.Regression.Trainers.LbfgsPoissonRegression());
-
-    // Train model if needed
-    var modelFilePath = "model.zip";
-    ITransformer model;
-
-    if (File.Exists(modelFilePath))
-    {
-        using var stream = File.OpenRead(modelFilePath);
-        model = mlContext.Model.Load(stream, out _);
-    }
-    else
-    {
-        model = pipeline.Fit(dataView);
-        using var stream = File.Create(modelFilePath);
-        mlContext.Model.Save(model, dataView.Schema, stream);
-    }
-
-    // Create prediction engine
-    var predictionEngine = mlContext.Model.CreatePredictionEngine<SubtitleData, SubtitlePrediction>(model);
-
-    // Find best match
     string? bestMatch = null;
-    double highestScore = double.MinValue;
+    double highestSimilarity = 0;
 
-    foreach (var subtitle in subtitleFiles)
+    foreach (var file in srtFiles)
     {
-        var prediction = predictionEngine.Predict(new SubtitleData { Content = transcription });
-        if (prediction.Score > highestScore)
+        var subtitleContent = File.ReadAllText(file);
+        // Remove SRT timestamps and numbers using regex
+        var cleanedContent = SrtTimeStamp().Replace(subtitleContent, string.Empty);
+        cleanedContent = HtmlTags().Replace(cleanedContent, string.Empty); // Remove HTML tags
+
+        var similarity = CalculateCosineSimilarity(transcription, cleanedContent);
+        if (similarity > highestSimilarity)
         {
-            highestScore = prediction.Score;
-            bestMatch = subtitle.FilePath;
+            highestSimilarity = similarity;
+            bestMatch = file;
         }
     }
 
     return bestMatch;
+}
+static double CalculateCosineSimilarity(string text1, string text2)
+{
+    // Convert to word frequency dictionaries
+    var words1 = text1.ToLower().Split([' ', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
+        .GroupBy(x => x)
+        .ToDictionary(x => x.Key, x => x.Count());
+    var words2 = text2.ToLower().Split([' ', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
+        .GroupBy(x => x)
+        .ToDictionary(x => x.Key, x => x.Count());
+
+    // Get unique words from both texts
+    var uniqueWords = words1.Keys.Union(words2.Keys);
+
+    // Calculate dot product and magnitudes
+    double dotProduct = 0;
+    double magnitude1 = 0;
+    double magnitude2 = 0;
+
+    foreach (var word in uniqueWords)
+    {
+        var value1 = words1.GetValueOrDefault(word);
+        var value2 = words2.GetValueOrDefault(word);
+        dotProduct += value1 * value2;
+        magnitude1 += value1 * value1;
+        magnitude2 += value2 * value2;
+    }
+
+    magnitude1 = Math.Sqrt(magnitude1);
+    magnitude2 = Math.Sqrt(magnitude2);
+
+    return magnitude1 > 0 && magnitude2 > 0 ? dotProduct / (magnitude1 * magnitude2) : 0;
 }
 
 string? ExtractSeasonEpisode(string subtitleFileName)
@@ -239,20 +240,14 @@ string? ExtractSeasonEpisode(string subtitleFileName)
     return match.Success ? match.Value : null;
 }
 
-public class SubtitleData
-{
-    public string? FilePath { get; set; }
-    public required string Content { get; set; }
-}
-
-public class SubtitlePrediction
-{
-    [ColumnName("Score")]
-    public float Score { get; set; }
-}
-
 partial class Program
 {
     [GeneratedRegex(@"s(\d{2})e(\d{2})", RegexOptions.IgnoreCase, "en-US")]
     public static partial Regex SeasonEpisodeRegex();
+
+    [GeneratedRegex(@"\d+\r?\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}\r?\n")]
+    public static partial Regex SrtTimeStamp();
+
+    [GeneratedRegex(@"<[^>]+>")]
+    public static partial Regex HtmlTags();
 }
