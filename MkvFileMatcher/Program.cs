@@ -200,8 +200,13 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
         }
     }
 
-    Console.WriteLine($" done! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.");
+    if (highestSimilarity < 0.6)
+    {
+        Console.WriteLine(" no match above 60% found.");
+        return null;
+    }
 
+    Console.WriteLine($" done! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.");
     return bestMatch;
 }
 
