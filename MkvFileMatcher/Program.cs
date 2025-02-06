@@ -5,6 +5,11 @@ using Whisper.net;
 using Whisper.net.Ggml;
 using Whisper.net.Logger;
 
+// TODO: Use System.CommandLine for command-line parsing
+// TODO: Detect show name from directory name
+// TODO: Find all seasons in the input folder
+// TODO: Add some parallelism to speed up processing
+
 // Paths
 string showName = "Young Sheldon";
 int season = 1;
@@ -32,7 +37,7 @@ if (!Directory.Exists(subtitlesFolder))
 // Print out what runtime Whisper is using
 Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
 
-// TODO: Change to use globbing via Matcher
+// TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
 foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
 {
     Console.WriteLine($"Processing: {Path.GetFileName(filePath)}");
@@ -44,26 +49,13 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
     // Step 2: Transcribe audio to text using Whisper
     var transcription = await TranscribeAudio(audioPath);
 
-    // Step 3: Match transcription with subtitle files using ML.NET
+    // Step 3: Match transcription with subtitle files
     var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitlesFolder);
 
-    if (bestMatch != null)
+    if (bestMatch is not null)
     {
         // Step 4: Rename .mkv file
-        var seasonEpisode = ExtractSeasonEpisode(bestMatch);
-        if (!string.IsNullOrEmpty(seasonEpisode))
-        {
-            var newFileName = $"{showName} - {seasonEpisode}.mkv";
-            var newFilePath = Path.Combine(inputFolder, newFileName);
-            if (File.Exists(newFilePath))
-            {
-                Console.WriteLine($"File already exists: {newFileName}");
-                continue;
-            }
-            Console.WriteLine($"Would rename to: {newFileName}");
-            //File.Move(filePath, newFilePath);
-            //Console.WriteLine($"Renamed to: {newFileName}");
-        }
+        RenameFile(showName, inputFolder, bestMatch);
     }
     else
     {
@@ -99,12 +91,14 @@ string? FindFfmpegPath()
 
 void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio)
 {
+    Console.Write($"Extracting audio from {Path.GetFileName(inputFile)} to {Path.GetFileName(outputAudio)} ...");
+
     var startTime = "00:00:00";
     var audioLengthMins = TimeSpan.FromMinutes(5);
     var time = audioLengthMins.ToString(@"hh\:mm\:ss");
     var codec = "pcm_s16le";
     var samplingRate = 16000;
-    var channels = 1;
+    var channels = 1; // mono
     var process = new Process
     {
         StartInfo = new ProcessStartInfo
@@ -138,10 +132,14 @@ void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio)
     {
         throw new Exception($"FFmpeg failed: {errorBuilder}");
     }
+
+    Console.WriteLine(" done!");
 }
 
 async Task<string> TranscribeAudio(string audioPath)
 {
+    Console.Write($"Transcribing audio from {Path.GetFileName(audioPath)} ...");
+
     using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
 
     if (!File.Exists(modelFileName))
@@ -157,10 +155,10 @@ async Task<string> TranscribeAudio(string audioPath)
         .WithSegmentEventHandler((segment) => sb.Append(segment.Text))
         .Build();
 
-    byte[] audioData = File.ReadAllBytes(audioPath);
-    using var ms = new MemoryStream(audioData);
+    using var fileStream = File.OpenRead(audioPath);
+    processor.Process(fileStream);
 
-    processor.Process(ms);
+    Console.WriteLine(" done!");
 
     return sb.ToString();
 }
@@ -169,14 +167,17 @@ static async Task DownloadModel(string fileName, GgmlType ggmlType)
 {
     Console.WriteLine($"Downloading Model {fileName}");
     using var modelStream = await WhisperGgmlDownloader.GetGgmlModelAsync(ggmlType);
-    using var fileWriter = File.OpenWrite(fileName);
-    await modelStream.CopyToAsync(fileWriter);
+    using var fileStream = File.OpenWrite(fileName);
+    await modelStream.CopyToAsync(fileStream);
 }
 
+// TODO: Cache the cleaned subtitle content so this isn't done on every call, e.g. just do it up front
 static string? FindBestMatchingSubtitle(string showName, int season, string transcription, string subtitlesFolder)
 {
+    Console.Write("Finding best matching subtitle ...");
+
     var fileNamePrefix = $"{showName} - S{season:D2}";
-    // TODO: Change to use globbing via Matcher
+    // TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
     var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
         .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
         .ToArray();
@@ -199,25 +200,27 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
         }
     }
 
+    Console.WriteLine($" done! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.");
+
     return bestMatch;
 }
+
 static double CalculateCosineSimilarity(string text1, string text2)
 {
-    // Convert to word frequency dictionaries
-    var words1 = text1.ToLower().Split([' ', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
-        .GroupBy(x => x)
-        .ToDictionary(x => x.Key, x => x.Count());
-    var words2 = text2.ToLower().Split([' ', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries)
-        .GroupBy(x => x)
-        .ToDictionary(x => x.Key, x => x.Count());
+    // Create word frequency dictionaries with initial capacity
+    // TODO: Reuse these dictionaries across calls
+    var words1 = new Dictionary<string, int>(1024);
+    var words2 = new Dictionary<string, int>(1024);
+    var uniqueWords = new HashSet<string>(1024);
 
-    // Get unique words from both texts
-    var uniqueWords = words1.Keys.Union(words2.Keys);
+    // Process first text
+    GetWordCounts(text1, words1, uniqueWords);
 
-    // Calculate dot product and magnitudes
-    double dotProduct = 0;
-    double magnitude1 = 0;
-    double magnitude2 = 0;
+    // Process second text
+    GetWordCounts(text2, words2, uniqueWords);
+
+    // Calculate similarity in a single pass
+    double dotProduct = 0, magnitude1 = 0, magnitude2 = 0;
 
     foreach (var word in uniqueWords)
     {
@@ -231,13 +234,54 @@ static double CalculateCosineSimilarity(string text1, string text2)
     magnitude1 = Math.Sqrt(magnitude1);
     magnitude2 = Math.Sqrt(magnitude2);
 
-    return magnitude1 > 0 && magnitude2 > 0 ? dotProduct / (magnitude1 * magnitude2) : 0;
+    return (magnitude1 > 0 && magnitude2 > 0) ? dotProduct / (magnitude1 * magnitude2) : 0;
+
+    static void GetWordCounts(string text1, Dictionary<string, int> words1, HashSet<string> uniqueWords)
+    {
+        foreach (var word in text1.AsSpan().EnumerateLines())
+        {
+            foreach (var splitWord in word.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var key = splitWord.ToLowerInvariant();
+                if (words1.TryGetValue(key, out var count))
+                {
+                    words1[key] = count + 1;
+                }
+                else
+                {
+                    words1[key] = 1;
+                    uniqueWords.Add(key);
+                }
+            }
+        }
+    }
 }
 
 string? ExtractSeasonEpisode(string subtitleFileName)
 {
     var match = SeasonEpisodeRegex().Match(Path.GetFileNameWithoutExtension(subtitleFileName));
     return match.Success ? match.Value : null;
+}
+
+void RenameFile(string showName, string inputFolder, string bestMatch)
+{
+    var seasonEpisode = ExtractSeasonEpisode(bestMatch);
+    if (!string.IsNullOrEmpty(seasonEpisode))
+    {
+        var newFileName = $"{showName} - {seasonEpisode}.mkv";
+        var newFilePath = Path.Combine(inputFolder, newFileName);
+
+        if (File.Exists(newFilePath))
+        {
+            // TODO: Handle this case better, maybe rename existing file to a different name
+            Console.WriteLine($"File already exists: {newFileName}");
+            return;
+        }
+
+        Console.WriteLine($"Would rename to: {newFileName}");
+        //File.Move(filePath, newFilePath);
+        //Console.WriteLine($"Renamed to: {newFileName}");
+    }
 }
 
 partial class Program
