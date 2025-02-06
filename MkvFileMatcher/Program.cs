@@ -34,6 +34,8 @@ if (!Directory.Exists(subtitlesFolder))
     return;
 }
 
+var subtitles = LoadSubtitles(showName, season, subtitlesFolder);
+
 // Print out what runtime Whisper is using
 Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
 
@@ -50,7 +52,7 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
     var transcription = await TranscribeAudio(audioPath);
 
     // Step 3: Match transcription with subtitle files
-    var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitlesFolder);
+    var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitles);
 
     if (bestMatch is not null)
     {
@@ -171,32 +173,23 @@ static async Task DownloadModel(string fileName, GgmlType ggmlType)
     await modelStream.CopyToAsync(fileStream);
 }
 
-// TODO: Cache the cleaned subtitle content so this isn't done on every call, e.g. just do it up front
-static string? FindBestMatchingSubtitle(string showName, int season, string transcription, string subtitlesFolder)
+static string? FindBestMatchingSubtitle(string showName, int season, string transcription, List<(string, string)> subtitles)
 {
     Console.Write("Finding best matching subtitle ...");
-
-    var fileNamePrefix = $"{showName} - S{season:D2}";
-    // TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
-    var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
-        .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
-        .ToArray();
 
     string? bestMatch = null;
     double highestSimilarity = 0;
 
-    foreach (var file in srtFiles)
+    foreach (var subtitle in subtitles)
     {
-        var subtitleContent = File.ReadAllText(file);
-        // Remove SRT timestamps and numbers using regex
-        var cleanedContent = SrtTimeStamp().Replace(subtitleContent, string.Empty);
-        cleanedContent = HtmlTags().Replace(cleanedContent, string.Empty); // Remove HTML tags
+        var fileName = subtitle.Item1;
+        var subtitleContent = subtitle.Item2;
 
-        var similarity = CalculateCosineSimilarity(transcription, cleanedContent);
+        var similarity = CalculateCosineSimilarity(transcription, subtitleContent);
         if (similarity > highestSimilarity)
         {
             highestSimilarity = similarity;
-            bestMatch = file;
+            bestMatch = fileName;
         }
     }
 
@@ -208,6 +201,31 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
 
     Console.WriteLine($" done! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.");
     return bestMatch;
+}
+
+static List<(string, string)> LoadSubtitles(string showName, int season, string subtitlesFolder)
+{
+    var fileNamePrefix = $"{showName} - S{season:D2}";
+
+    // TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
+    var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
+        .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
+        .ToArray();
+
+    var result = new List<(string, string)>(srtFiles.Length);
+
+    foreach (var file in srtFiles)
+    {
+        var subtitleContent = File.ReadAllText(file);
+        // Remove SRT timestamps and numbers using regex
+        var cleanedContent = SrtTimeStamp().Replace(subtitleContent, string.Empty);
+        cleanedContent = HtmlTags().Replace(cleanedContent, string.Empty); // Remove HTML tags
+        result.Add((file, cleanedContent));
+    }
+
+    Console.WriteLine($"Loaded {result.Count} subtitle files from {subtitlesFolder}.");
+
+    return result;
 }
 
 static double CalculateCosineSimilarity(string text1, string text2)
@@ -241,20 +259,22 @@ static double CalculateCosineSimilarity(string text1, string text2)
 
     return (magnitude1 > 0 && magnitude2 > 0) ? dotProduct / (magnitude1 * magnitude2) : 0;
 
-    static void GetWordCounts(string text1, Dictionary<string, int> words1, HashSet<string> uniqueWords)
+    static void GetWordCounts(string text1, Dictionary<string, int> wordCounts, HashSet<string> uniqueWords)
     {
         foreach (var word in text1.AsSpan().EnumerateLines())
         {
+            // TODO: Avoid using ToString() and Split() here to improve performance
             foreach (var splitWord in word.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries))
             {
                 var key = splitWord.ToLowerInvariant();
-                if (words1.TryGetValue(key, out var count))
+                // TODO: Use span-based alternate dictionary lookup
+                if (wordCounts.TryGetValue(key, out var count))
                 {
-                    words1[key] = count + 1;
+                    wordCounts[key] = count + 1;
                 }
                 else
                 {
-                    words1[key] = 1;
+                    wordCounts[key] = 1;
                     uniqueWords.Add(key);
                 }
             }
