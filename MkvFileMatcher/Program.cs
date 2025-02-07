@@ -13,12 +13,15 @@ using Whisper.net.Logger;
 // Paths
 string showName = "Young Sheldon";
 int season = 1;
+int? episode = null;
 string inputFolder = @$"G:\Video\{showName}\Season {season}";
-string subtitlesFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
+string subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
 string ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
 
 var ggmlType = GgmlType.Base;
 var modelFileName = "ggml-base.bin";
+var chunkLength = TimeSpan.FromMinutes(5);
+var sampleChunks = 3;
 
 if (!Directory.Exists(inputFolder))
 {
@@ -34,7 +37,7 @@ if (!Directory.Exists(subtitlesFolder))
     return;
 }
 
-var subtitles = LoadSubtitles(showName, season, subtitlesFolder);
+var subtitles = LoadSubtitles(showName, season, subtitlesFolder, chunkLength, sampleChunks);
 
 // Print out what runtime Whisper is using
 Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
@@ -44,30 +47,54 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
 {
     Console.WriteLine($"Processing: {Path.GetFileName(filePath)}");
 
-    // Step 1: Extract audio from the .mkv file
-    var audioPath = Path.ChangeExtension(filePath, ".wav");
-    ExtractAudio(ffmpegPath, filePath, audioPath);
-
-    // Step 2: Transcribe audio to text using Whisper
-    var transcription = await TranscribeAudio(audioPath);
-
-    // Step 3: Match transcription with subtitle files
-    var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitles);
-
-    if (bestMatch is not null)
+    if (episode is not null && !Path.GetFileName(filePath).Contains($"S{season:D2}E{episode:D2}", StringComparison.OrdinalIgnoreCase))
     {
-        // Step 4: Rename .mkv file
-        RenameFile(showName, inputFolder, bestMatch);
-    }
-    else
-    {
-        Console.WriteLine("No matching subtitle found.");
+        Console.WriteLine("Skipping episode.");
+        continue;
     }
 
-    // Clean up
-    if (File.Exists(audioPath))
+    for (var i = 0; i < sampleChunks; i++)
     {
-        File.Delete(audioPath);
+        var chunk = i + 1;
+        var sampleLength = chunkLength * chunk;
+
+        // Step 1: Extract audio from the .mkv file
+        var audioPath = Path.ChangeExtension(filePath, ".wav");
+
+        try
+        {
+            ExtractAudio(ffmpegPath, filePath, audioPath, sampleLength);
+
+            // Step 2: Transcribe audio to text using Whisper
+            var transcription = await TranscribeAudio(audioPath);
+
+            // Step 3: Match transcription with subtitle files
+            var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitles, chunk);
+
+            if (bestMatch is not null)
+            {
+                // Step 4: Rename .mkv file
+                RenameFile(showName, inputFolder, filePath, bestMatch);
+                break;
+            }
+
+            if (i == sampleChunks - 1)
+            {
+                Console.WriteLine("No matching subtitle found.");
+            }
+            else
+            {
+                Console.WriteLine($"No matching subtitle found, increasing sample size to {chunkLength * (chunk + 1)}.");
+            }
+        }
+        finally
+        {
+            // Clean up
+            if (File.Exists(audioPath))
+            {
+                File.Delete(audioPath);
+            }
+        }
     }
 }
 
@@ -81,7 +108,7 @@ string? FindFfmpegPath()
 
     foreach (var path in paths)
     {
-        var ffmpegPath = Path.Combine(path, OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
+        var ffmpegPath = Path.Join(path, OperatingSystem.IsWindows() ? "ffmpeg.exe" : "ffmpeg");
         if (File.Exists(ffmpegPath))
         {
             return ffmpegPath;
@@ -91,13 +118,12 @@ string? FindFfmpegPath()
     return null;
 }
 
-void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio)
+void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio, TimeSpan duration)
 {
     Console.Write($"Extracting audio from {Path.GetFileName(inputFile)} to {Path.GetFileName(outputAudio)} ...");
 
     var startTime = "00:00:00";
-    var audioLengthMins = TimeSpan.FromMinutes(5);
-    var time = audioLengthMins.ToString(@"hh\:mm\:ss");
+    var time = duration.ToString(@"hh\:mm\:ss");
     var codec = "pcm_s16le";
     var samplingRate = 16000;
     var channels = 1; // mono
@@ -173,7 +199,7 @@ static async Task DownloadModel(string fileName, GgmlType ggmlType)
     await modelStream.CopyToAsync(fileStream);
 }
 
-static string? FindBestMatchingSubtitle(string showName, int season, string transcription, List<(string, string)> subtitles)
+static string? FindBestMatchingSubtitle(string showName, int season, string transcription, List<(string, string[])> subtitles, int chunk)
 {
     Console.Write("Finding best matching subtitle ...");
 
@@ -183,7 +209,7 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
     foreach (var subtitle in subtitles)
     {
         var fileName = subtitle.Item1;
-        var subtitleContent = subtitle.Item2;
+        var subtitleContent = string.Join(Environment.NewLine, subtitle.Item2.Take(chunk));
 
         var similarity = CalculateCosineSimilarity(transcription, subtitleContent);
         if (similarity > highestSimilarity)
@@ -193,9 +219,9 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
         }
     }
 
-    if (highestSimilarity < 0.6)
+    if (highestSimilarity < 0.7)
     {
-        Console.WriteLine(" no match above 60% found.");
+        Console.WriteLine(" no match above 70% found.");
         return null;
     }
 
@@ -203,7 +229,7 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
     return bestMatch;
 }
 
-static List<(string, string)> LoadSubtitles(string showName, int season, string subtitlesFolder)
+static List<(string, string[])> LoadSubtitles(string showName, int season, string subtitlesFolder, TimeSpan duration, int chunkCount)
 {
     var fileNamePrefix = $"{showName} - S{season:D2}";
 
@@ -212,20 +238,102 @@ static List<(string, string)> LoadSubtitles(string showName, int season, string 
         .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
         .ToArray();
 
-    var result = new List<(string, string)>(srtFiles.Length);
+    var result = new List<(string, string[])>(srtFiles.Length);
 
     foreach (var file in srtFiles)
     {
-        var subtitleContent = File.ReadAllText(file);
-        // Remove SRT timestamps and numbers using regex
-        var cleanedContent = SrtTimeStamp().Replace(subtitleContent, string.Empty);
-        cleanedContent = HtmlTags().Replace(cleanedContent, string.Empty); // Remove HTML tags
-        result.Add((file, cleanedContent));
+        var chunks = new string[chunkCount];
+        for (var i = 0; i < chunkCount; i++)
+        {
+            var start = i * duration;
+            chunks[i] = GetSubtitlesText(file, start, duration);
+        }
+        result.Add((file, chunks));
     }
 
     Console.WriteLine($"Loaded {result.Count} subtitle files from {subtitlesFolder}.");
 
     return result;
+}
+
+static string GetSubtitlesText(string filePath, TimeSpan startTime, TimeSpan duration)
+{
+    // Subtitle file will be in SRT format, e.g.:
+    // 1
+    // 00:00:00,552 --> 00:00:02,513
+    // Here we go.
+    // Pad thai, no peanuts.
+
+    // 2
+    // 00:00:02,633 --> 00:00:03,969
+    // But does it have peanut oil?
+
+    var sb = new StringBuilder();
+    var endTime = startTime + duration;
+
+    // Read all lines at once for better performance
+    var lines = File.ReadAllLines(filePath);
+
+    for (int i = 0; i < lines.Length; i++)
+    {
+        var line = lines[i];
+
+        // Skip empty lines
+        if (string.IsNullOrWhiteSpace(line))
+        {
+            continue;
+        }
+
+        // Skip index number
+        if (int.TryParse(line, out var _))
+        {
+            continue;
+        }
+
+        // Parse timestamp line
+
+        // Extract start and end times
+        var timestamps = line.Split(" --> ");
+        if (timestamps.Length != 2)
+        {
+            continue;
+        }
+
+        var start = timestamps[0].Replace(',', '.');
+
+        if (TimeSpan.TryParse(start, out var startTimeStamp))
+        {
+            // Skip if we're before our start time
+            if (startTimeStamp < startTime)
+            {
+                continue;
+            }
+
+            // Skip if we're past our end time
+            if (startTimeStamp > endTime)
+            {
+                break;
+            }
+
+            // Advance to next line
+            i++;
+        }
+
+        // Collect subtitle text until empty line
+        while (i < lines.Length)
+        {
+            line = lines[i];
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                break;
+            }
+
+            sb.AppendLine(HtmlTags().Replace(line, string.Empty));
+            i++;
+        }
+    }
+
+    return sb.ToString().Trim();
 }
 
 static double CalculateCosineSimilarity(string text1, string text2)
@@ -288,13 +396,13 @@ string? ExtractSeasonEpisode(string subtitleFileName)
     return match.Success ? match.Value : null;
 }
 
-void RenameFile(string showName, string inputFolder, string bestMatch)
+void RenameFile(string showName, string inputFolder, string currentFilePath, string bestMatch)
 {
     var seasonEpisode = ExtractSeasonEpisode(bestMatch);
     if (!string.IsNullOrEmpty(seasonEpisode))
     {
         var newFileName = $"{showName} - {seasonEpisode}.mkv";
-        var newFilePath = Path.Combine(inputFolder, newFileName);
+        var newFilePath = Path.Join(inputFolder, newFileName);
 
         if (File.Exists(newFilePath))
         {
@@ -303,9 +411,9 @@ void RenameFile(string showName, string inputFolder, string bestMatch)
             return;
         }
 
-        Console.WriteLine($"Would rename to: {newFileName}");
-        //File.Move(filePath, newFilePath);
-        //Console.WriteLine($"Renamed to: {newFileName}");
+        //Console.WriteLine($"Would rename to: {newFileName}");
+        File.Move(currentFilePath, newFilePath);
+        Console.WriteLine($"Renamed to: {newFileName}");
     }
 }
 
