@@ -12,14 +12,14 @@ using Whisper.net.Logger;
 // TODO: Add some parallelism to speed up processing
 
 var showName = "The Big Bang Theory";
-//int season = 1;
+int? specificSeason = null;
 int? episode = null;
 var inputFolder = @$"G:\Video\{showName}";
 var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
 var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
 var ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
 
-var whatIf = true;
+var whatIf = false;
 var ggmlType = GgmlType.LargeV3Turbo;
 var chunkLength = TimeSpan.FromMinutes(5);
 var sampleChunks = 3;
@@ -38,6 +38,7 @@ if (!Directory.Exists(subtitlesFolder))
     return;
 }
 
+using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
 using var whisperFactory = await InitializeWhisper(cacheDir, ggmlType);
 
 var subtitles = LoadSubtitles(showName, subtitlesFolder, chunkLength, sampleChunks);
@@ -48,6 +49,11 @@ var subtitles = LoadSubtitles(showName, subtitlesFolder, chunkLength, sampleChun
 var mkvFiles = GetMkvFiles(inputFolder);
 foreach (var season in mkvFiles.Keys)
 {
+    if (specificSeason is not null && season != specificSeason.Value)
+    {
+        continue;
+    }
+
     var files = mkvFiles[season];
     var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 1 };
     await Parallel.ForEachAsync(files, parallelOptions, async (filePath, ct) => await ProcessFile(filePath, season));
@@ -207,11 +213,9 @@ async Task<string> TranscribeAudio(string audioPath, int season)
     WriteLine($"{fileName}: Transcribing audio from {fileName} ...");
 
     var sb = new StringBuilder();
-    await using var processor = whisperFactory.CreateBuilder()
-        .WithLanguage("en")
-        .WithPrompt($"This is an episode of a TV show called {showName} from season {season}")
-        .WithThreads(4)
-        .Build();
+
+    var whisperBuilder = CreateWhisperBuilder(whisperFactory, showName, season);
+    await using var processor = whisperBuilder.Build();
 
     using var fileStream = File.OpenRead(audioPath);
     await foreach (var segment in processor.ProcessAsync(fileStream))
@@ -485,8 +489,6 @@ static void WriteLine(string line, ConsoleColor? color = null)
 
 static async Task<WhisperFactory> InitializeWhisper(string cacheDir, GgmlType ggmlType)
 {
-    using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
-
     var modelFileName = $"ggml-{Enum.GetName(ggmlType)!.ToLowerInvariant()}.bin";
     var modelFilePath = Path.Join(cacheDir, "whisper", modelFileName);
 
@@ -496,7 +498,18 @@ static async Task<WhisperFactory> InitializeWhisper(string cacheDir, GgmlType gg
     }
 
     var whisperFactory = WhisperFactory.FromPath(modelFilePath);
+
     return whisperFactory;
+}
+
+static WhisperProcessorBuilder CreateWhisperBuilder(WhisperFactory whisperFactory, string showName, int season)
+{
+    var whisperBuilder = whisperFactory.CreateBuilder()
+        .WithLanguage("en")
+        .WithPrompt($"This is an episode from season {season} of the TV series '{showName}'");
+        //.WithThreads(4);
+
+    return whisperBuilder;
 }
 
 partial class Program
