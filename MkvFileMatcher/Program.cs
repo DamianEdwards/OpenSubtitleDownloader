@@ -11,7 +11,7 @@ using Whisper.net.Logger;
 // TODO: Add some parallelism to speed up processing
 
 var showName = "Young Sheldon";
-int season = 2;
+int season = 5;
 int? episode = null;
 var inputFolder = @$"G:\Video\{showName}\Season {season}";
 var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
@@ -19,7 +19,7 @@ var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFol
 var ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
 
 var whatIf = false;
-var ggmlType = GgmlType.MediumEn;
+var ggmlType = GgmlType.LargeV3Turbo;
 var chunkLength = TimeSpan.FromMinutes(5);
 var sampleChunks = 3;
 
