@@ -10,16 +10,16 @@ using Whisper.net.Logger;
 // TODO: Find all seasons in the input folder
 // TODO: Add some parallelism to speed up processing
 
-// Paths
-string showName = "Young Sheldon";
-int season = 1;
+var showName = "Young Sheldon";
+int season = 2;
 int? episode = null;
-string inputFolder = @$"G:\Video\{showName}\Season {season}";
-string subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
-string ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
+var inputFolder = @$"G:\Video\{showName}\Season {season}";
+var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
+var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
+var ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
 
-var ggmlType = GgmlType.Base;
-var modelFileName = "ggml-base.bin";
+var whatIf = false;
+var ggmlType = GgmlType.MediumEn;
 var chunkLength = TimeSpan.FromMinutes(5);
 var sampleChunks = 3;
 
@@ -40,7 +40,7 @@ if (!Directory.Exists(subtitlesFolder))
 var subtitles = LoadSubtitles(showName, season, subtitlesFolder, chunkLength, sampleChunks);
 
 // Print out what runtime Whisper is using
-Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
+//Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
 
 // TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
 foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
@@ -169,17 +169,21 @@ async Task<string> TranscribeAudio(string audioPath)
     Console.Write($"Transcribing audio from {Path.GetFileName(audioPath)} ...");
 
     using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
+    
+    var modelFileName = $"ggml-{Enum.GetName(ggmlType)!.ToLowerInvariant()}.bin";
+    var modelFilePath = Path.Combine(cacheDir, "whisper", modelFileName);
 
-    if (!File.Exists(modelFileName))
+    if (!File.Exists(modelFilePath))
     {
-        await DownloadModel(modelFileName, ggmlType);
+        await DownloadModel(modelFilePath, ggmlType);
     }
 
-    using var whisperFactory = WhisperFactory.FromPath(modelFileName);
+    using var whisperFactory = WhisperFactory.FromPath(modelFilePath);
 
     var sb = new StringBuilder();
     using var processor = whisperFactory.CreateBuilder()
         .WithLanguage("en")
+        .WithPrompt($"This is an episode of a TV show called {showName} from season {season}")
         .WithSegmentEventHandler((segment) => sb.Append(segment.Text))
         .Build();
 
@@ -191,11 +195,12 @@ async Task<string> TranscribeAudio(string audioPath)
     return sb.ToString();
 }
 
-static async Task DownloadModel(string fileName, GgmlType ggmlType)
+static async Task DownloadModel(string filePath, GgmlType ggmlType)
 {
-    Console.WriteLine($"Downloading Model {fileName}");
+    Console.WriteLine($"Downloading model {Enum.GetName(ggmlType)} to {Path.GetFileName(filePath)}");
+
     using var modelStream = await WhisperGgmlDownloader.GetGgmlModelAsync(ggmlType);
-    using var fileStream = File.OpenWrite(fileName);
+    using var fileStream = File.OpenWrite(filePath);
     await modelStream.CopyToAsync(fileStream);
 }
 
@@ -219,9 +224,9 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
         }
     }
 
-    if (highestSimilarity < 0.7)
+    if (highestSimilarity < 0.8)
     {
-        Console.WriteLine(" no match above 70% found.");
+        Console.WriteLine(" no match above 80% found.");
         return null;
     }
 
@@ -411,9 +416,15 @@ void RenameFile(string showName, string inputFolder, string currentFilePath, str
             return;
         }
 
-        //Console.WriteLine($"Would rename to: {newFileName}");
-        File.Move(currentFilePath, newFilePath);
-        Console.WriteLine($"Renamed to: {newFileName}");
+        if (whatIf)
+        {
+            Console.WriteLine($"Would rename to: {newFileName}");
+        }
+        else
+        {
+            File.Move(currentFilePath, newFilePath);
+            Console.WriteLine($"Renamed to: {newFileName}");
+        }
     }
 }
 
