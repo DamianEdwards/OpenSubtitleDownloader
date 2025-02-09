@@ -1,6 +1,7 @@
 ﻿using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
+using Microsoft.Extensions.FileSystemGlobbing;
 using Whisper.net;
 using Whisper.net.Ggml;
 using Whisper.net.Logger;
@@ -10,48 +11,82 @@ using Whisper.net.Logger;
 // TODO: Find all seasons in the input folder
 // TODO: Add some parallelism to speed up processing
 
-var showName = "Young Sheldon";
-int season = 5;
+var showName = "The Big Bang Theory";
+//int season = 1;
 int? episode = null;
-var inputFolder = @$"G:\Video\{showName}\Season {season}";
+var inputFolder = @$"G:\Video\{showName}";
 var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
 var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
 var ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
 
-var whatIf = false;
+var whatIf = true;
 var ggmlType = GgmlType.LargeV3Turbo;
 var chunkLength = TimeSpan.FromMinutes(5);
 var sampleChunks = 3;
 
 if (!Directory.Exists(inputFolder))
 {
-    Console.WriteLine("Input folder not found.");
+    WriteLine("Input folder not found.", ConsoleColor.Red);
     Environment.ExitCode = 1;
     return;
 }
 
 if (!Directory.Exists(subtitlesFolder))
 {
-    Console.WriteLine("Subtitles folder not found.");
+    WriteLine("Subtitles folder not found.", ConsoleColor.Red);
     Environment.ExitCode = 2;
     return;
 }
 
-var subtitles = LoadSubtitles(showName, season, subtitlesFolder, chunkLength, sampleChunks);
+using var whisperFactory = await InitializeWhisper(cacheDir, ggmlType);
+
+var subtitles = LoadSubtitles(showName, subtitlesFolder, chunkLength, sampleChunks);
 
 // Print out what runtime Whisper is using
-//Console.WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}");
+//WriteLine($"Whisper runtime: {WhisperFactory.GetRuntimeInfo()}", ConsoleColor.Gray);
 
-// TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
-foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
+var mkvFiles = GetMkvFiles(inputFolder);
+foreach (var season in mkvFiles.Keys)
 {
-    Console.WriteLine($"Processing: {Path.GetFileName(filePath)}");
+    var files = mkvFiles[season];
+    var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = 1 };
+    await Parallel.ForEachAsync(files, parallelOptions, async (filePath, ct) => await ProcessFile(filePath, season));
+    //foreach (var filePath in files)
+    //{
+    //    await ProcessFile(filePath, season);
+    //}
+}
 
-    if (episode is not null && !Path.GetFileName(filePath).Contains($"S{season:D2}E{episode:D2}", StringComparison.OrdinalIgnoreCase))
+Dictionary<int, List<string>> GetMkvFiles(string inputFolder)
+{
+    var matcher = new Matcher();
+    matcher.AddIncludePatterns(["Season*/*.mkv"]);
+
+    var matchingFiles = matcher.GetResultsInFullPath(inputFolder);
+    return matchingFiles
+        .Select(p => (Season: ExtractSeasonFromFilePath(p) ?? -1, FilePath: p))
+        .Where(p => p.Season > 0)
+        .GroupBy(item => item.Season)
+        .ToDictionary(g => g.Key, g => g.Select(item => item.FilePath).ToList());
+}
+
+static int? ExtractSeasonFromFilePath(string filePath)
+{
+    var match = DirectorySeasonRegex().Match(filePath);
+    return match.Success && int.TryParse(match.Groups[1].Value, out var season) ? season : null;
+}
+
+async Task ProcessFile(string filePath, int season)
+{
+    var fileName = Path.GetFileName(filePath);
+
+    if (episode is not null && !fileName.Contains($"S{season:D2}E{episode:D2}", StringComparison.OrdinalIgnoreCase))
     {
-        Console.WriteLine("Skipping episode.");
-        continue;
+        WriteLine($"{fileName}: Skipping episode.", ConsoleColor.Gray);
+        return;
     }
+
+    WriteLine($"{fileName}: Processing file {filePath}");
 
     for (var i = 0; i < sampleChunks; i++)
     {
@@ -66,10 +101,10 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
             ExtractAudio(ffmpegPath, filePath, audioPath, sampleLength);
 
             // Step 2: Transcribe audio to text using Whisper
-            var transcription = await TranscribeAudio(audioPath);
+            var transcription = await TranscribeAudio(audioPath, season);
 
             // Step 3: Match transcription with subtitle files
-            var bestMatch = FindBestMatchingSubtitle(showName, season, transcription, subtitles, chunk);
+            var bestMatch = FindBestMatchingSubtitle(filePath, showName, season, transcription, subtitles[season], chunk);
 
             if (bestMatch is not null)
             {
@@ -80,11 +115,11 @@ foreach (var filePath in Directory.GetFiles(inputFolder, "*.mkv"))
 
             if (i == sampleChunks - 1)
             {
-                Console.WriteLine("No matching subtitle found.");
+                WriteLine($"{fileName}: No matching subtitle found.", ConsoleColor.Red);
             }
             else
             {
-                Console.WriteLine($"No matching subtitle found, increasing sample size to {chunkLength * (chunk + 1)}.");
+                WriteLine($"{fileName}: No matching subtitle found, increasing sample size to {chunkLength * (chunk + 1)}.", ConsoleColor.Blue);
             }
         }
         finally
@@ -118,9 +153,10 @@ string? FindFfmpegPath()
     return null;
 }
 
-void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio, TimeSpan duration)
+static void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio, TimeSpan duration)
 {
-    Console.Write($"Extracting audio from {Path.GetFileName(inputFile)} to {Path.GetFileName(outputAudio)} ...");
+    var fileName = Path.GetFileName(inputFile);
+    WriteLine($"{fileName}: Extracting audio from {fileName} to {Path.GetFileName(outputAudio)} ...");
 
     var startTime = "00:00:00";
     var time = duration.ToString(@"hh\:mm\:ss");
@@ -161,52 +197,45 @@ void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio, TimeS
         throw new Exception($"FFmpeg failed: {errorBuilder}");
     }
 
-    Console.WriteLine(" done!");
+    WriteLine($"{fileName}: Audio extraction complete.");
 }
 
-async Task<string> TranscribeAudio(string audioPath)
+// TODO: Pass in the StringBuilder and pool them at the call site
+async Task<string> TranscribeAudio(string audioPath, int season)
 {
-    Console.Write($"Transcribing audio from {Path.GetFileName(audioPath)} ...");
-
-    using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
-    
-    var modelFileName = $"ggml-{Enum.GetName(ggmlType)!.ToLowerInvariant()}.bin";
-    var modelFilePath = Path.Combine(cacheDir, "whisper", modelFileName);
-
-    if (!File.Exists(modelFilePath))
-    {
-        await DownloadModel(modelFilePath, ggmlType);
-    }
-
-    using var whisperFactory = WhisperFactory.FromPath(modelFilePath);
+    var fileName = Path.GetFileName(audioPath);
+    WriteLine($"{fileName}: Transcribing audio from {fileName} ...");
 
     var sb = new StringBuilder();
-    using var processor = whisperFactory.CreateBuilder()
+    await using var processor = whisperFactory.CreateBuilder()
         .WithLanguage("en")
         .WithPrompt($"This is an episode of a TV show called {showName} from season {season}")
-        .WithSegmentEventHandler((segment) => sb.Append(segment.Text))
+        .WithThreads(4)
         .Build();
 
     using var fileStream = File.OpenRead(audioPath);
-    processor.Process(fileStream);
+    await foreach (var segment in processor.ProcessAsync(fileStream))
+    {
+        sb.Append(segment.Text);
+    }
 
-    Console.WriteLine(" done!");
+    WriteLine($"{fileName}: Transcribing done!");
 
     return sb.ToString();
 }
 
 static async Task DownloadModel(string filePath, GgmlType ggmlType)
 {
-    Console.WriteLine($"Downloading model {Enum.GetName(ggmlType)} to {Path.GetFileName(filePath)}");
+    WriteLine($"Downloading model {Enum.GetName(ggmlType)} to {Path.GetFileName(filePath)}", ConsoleColor.Gray);
 
     using var modelStream = await WhisperGgmlDownloader.GetGgmlModelAsync(ggmlType);
     using var fileStream = File.OpenWrite(filePath);
     await modelStream.CopyToAsync(fileStream);
 }
 
-static string? FindBestMatchingSubtitle(string showName, int season, string transcription, List<(string, string[])> subtitles, int chunk)
+static string? FindBestMatchingSubtitle(string filePath, string showName, int season, string transcription, List<(string, string[])> subtitles, int chunk)
 {
-    Console.Write("Finding best matching subtitle ...");
+    WriteLine($"{Path.GetFileName(filePath)}: Finding best matching subtitle");
 
     string? bestMatch = null;
     double highestSimilarity = 0;
@@ -226,37 +255,46 @@ static string? FindBestMatchingSubtitle(string showName, int season, string tran
 
     if (highestSimilarity < 0.8)
     {
-        Console.WriteLine(" no match above 80% found.");
+        WriteLine($"{Path.GetFileName(filePath)}: No matching subtitle above 80% found (highest was {highestSimilarity:P2}).", ConsoleColor.Yellow);
         return null;
     }
 
-    Console.WriteLine($" done! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.");
+    WriteLine($"{Path.GetFileName(filePath)}: Match found! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.", ConsoleColor.Green);
     return bestMatch;
 }
 
-static List<(string, string[])> LoadSubtitles(string showName, int season, string subtitlesFolder, TimeSpan duration, int chunkCount)
+static Dictionary<int, List<(string, string[])>> LoadSubtitles(string showName, string subtitlesFolder, TimeSpan duration, int chunkCount)
 {
-    var fileNamePrefix = $"{showName} - S{season:D2}";
-
     // TODO: Change to use globbing via Microsoft.Extensions.FileSystemGlobbing
     var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
-        .Where(file => Path.GetFileName(file).StartsWith(fileNamePrefix, StringComparison.OrdinalIgnoreCase))
+        .Select(file =>
+        {
+            var seasonParsed = int.TryParse(ExtractSeasonEpisode(file), out var season);
+            return (Season: seasonParsed ? season : -1, FilePath: file);
+        })
+        .Where(file => file.Season >= 0)
         .ToArray();
 
-    var result = new List<(string, string[])>(srtFiles.Length);
+    var result = new Dictionary<int, List<(string, string[])>>();
 
-    foreach (var file in srtFiles)
+    foreach (var (season, filePath) in srtFiles)
     {
+        if (!result.TryGetValue(season, out var seasonFiles))
+        {
+            seasonFiles = [];
+            result[season] = seasonFiles;
+        }
+
         var chunks = new string[chunkCount];
         for (var i = 0; i < chunkCount; i++)
         {
             var start = i * duration;
-            chunks[i] = GetSubtitlesText(file, start, duration);
+            chunks[i] = GetSubtitlesText(filePath, start, duration);
         }
-        result.Add((file, chunks));
+        seasonFiles.Add((filePath, chunks));
     }
 
-    Console.WriteLine($"Loaded {result.Count} subtitle files from {subtitlesFolder}.");
+    WriteLine($"Loaded {srtFiles.Length} subtitle files for {result.Keys.Count} seasons from {subtitlesFolder}.", ConsoleColor.Gray);
 
     return result;
 }
@@ -395,10 +433,10 @@ static double CalculateCosineSimilarity(string text1, string text2)
     }
 }
 
-string? ExtractSeasonEpisode(string subtitleFileName)
+static string? ExtractSeasonEpisode(string fileName)
 {
-    var match = SeasonEpisodeRegex().Match(Path.GetFileNameWithoutExtension(subtitleFileName));
-    return match.Success ? match.Value : null;
+    var match = SeasonEpisodeRegex().Match(Path.GetFileNameWithoutExtension(fileName));
+    return match.Success ? match.Groups[1].Value : null;
 }
 
 void RenameFile(string showName, string inputFolder, string currentFilePath, string bestMatch)
@@ -412,26 +450,64 @@ void RenameFile(string showName, string inputFolder, string currentFilePath, str
         if (File.Exists(newFilePath))
         {
             // TODO: Handle this case better, maybe rename existing file to a different name
-            Console.WriteLine($"File already exists: {newFileName}");
+            WriteLine($"File already exists: {newFileName}", ConsoleColor.Blue);
             return;
         }
 
         if (whatIf)
         {
-            Console.WriteLine($"Would rename to: {newFileName}");
+            WriteLine($"Would rename to: {newFileName}", ConsoleColor.Yellow);
         }
         else
         {
             File.Move(currentFilePath, newFilePath);
-            Console.WriteLine($"Renamed to: {newFileName}");
+            WriteLine($"Renamed to: {newFileName}", ConsoleColor.Green);
         }
     }
 }
 
+static void WriteLine(string line, ConsoleColor? color = null)
+{
+    if (color is null)
+    {
+        Console.WriteLine(line);
+        return;
+    }
+
+    lock (ConsoleWritingLock)
+    {
+        var existingColor = Console.ForegroundColor;
+        Console.ForegroundColor = color.Value;
+        Console.WriteLine(line);
+        Console.ForegroundColor = existingColor;
+    }
+}
+
+static async Task<WhisperFactory> InitializeWhisper(string cacheDir, GgmlType ggmlType)
+{
+    using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
+
+    var modelFileName = $"ggml-{Enum.GetName(ggmlType)!.ToLowerInvariant()}.bin";
+    var modelFilePath = Path.Join(cacheDir, "whisper", modelFileName);
+
+    if (!File.Exists(modelFilePath))
+    {
+        await DownloadModel(modelFilePath, ggmlType);
+    }
+
+    var whisperFactory = WhisperFactory.FromPath(modelFilePath);
+    return whisperFactory;
+}
+
 partial class Program
 {
+    public static Lock ConsoleWritingLock = new();
+
     [GeneratedRegex(@"s(\d{2})e(\d{2})", RegexOptions.IgnoreCase, "en-US")]
     public static partial Regex SeasonEpisodeRegex();
+
+    [GeneratedRegex(@"Season\s+(\d+)", RegexOptions.IgnoreCase, "en-US")]
+    private static partial Regex DirectorySeasonRegex();
 
     [GeneratedRegex(@"\d+\r?\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}\r?\n")]
     public static partial Regex SrtTimeStamp();
