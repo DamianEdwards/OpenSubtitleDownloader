@@ -115,7 +115,7 @@ async Task ProcessFile(string filePath, int season)
             if (bestMatch is not null)
             {
                 // Step 4: Rename .mkv file
-                RenameFile(showName, inputFolder, filePath, bestMatch);
+                RenameFile(showName, season, inputFolder, filePath, bestMatch);
                 break;
             }
 
@@ -273,7 +273,7 @@ static Dictionary<int, List<(string, string[])>> LoadSubtitles(string showName, 
     var srtFiles = Directory.GetFiles(subtitlesFolder, "*.srt")
         .Select(file =>
         {
-            var seasonParsed = int.TryParse(ExtractSeasonEpisode(file), out var season);
+            var seasonParsed = int.TryParse(ExtractSeasonEpisode(file, justSeason: true), out var season);
             return (Season: seasonParsed ? season : -1, FilePath: file);
         })
         .Where(file => file.Season >= 0)
@@ -437,19 +437,19 @@ static double CalculateCosineSimilarity(string text1, string text2)
     }
 }
 
-static string? ExtractSeasonEpisode(string fileName)
+static string? ExtractSeasonEpisode(string fileName, bool justSeason = false)
 {
     var match = SeasonEpisodeRegex().Match(Path.GetFileNameWithoutExtension(fileName));
-    return match.Success ? match.Groups[1].Value : null;
+    return match.Success ? match.Groups[justSeason ? 1 : 0].Value : null;
 }
 
-void RenameFile(string showName, string inputFolder, string currentFilePath, string bestMatch)
+void RenameFile(string showName, int season, string inputFolder, string currentFilePath, string bestMatch)
 {
     var seasonEpisode = ExtractSeasonEpisode(bestMatch);
     if (!string.IsNullOrEmpty(seasonEpisode))
     {
         var newFileName = $"{showName} - {seasonEpisode}.mkv";
-        var newFilePath = Path.Join(inputFolder, newFileName);
+        var newFilePath = Path.Join(inputFolder, $"Season {season:D2}", newFileName);
 
         if (File.Exists(newFilePath))
         {
@@ -506,8 +506,8 @@ static WhisperProcessorBuilder CreateWhisperBuilder(WhisperFactory whisperFactor
 {
     var whisperBuilder = whisperFactory.CreateBuilder()
         .WithLanguage("en")
-        .WithPrompt($"This is an episode from season {season} of the TV series '{showName}'");
-        //.WithThreads(4);
+        .WithPrompt($"This is an episode from season {season} of the TV series '{showName}'")
+        .WithThreads(4);
 
     return whisperBuilder;
 }
