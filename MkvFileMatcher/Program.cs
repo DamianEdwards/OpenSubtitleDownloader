@@ -14,8 +14,8 @@ using Whisper.net.Logger;
 // TODO: Add some parallelism to speed up processing
 
 var showName = "Brooklyn Nine-Nine";
-int? specificSeason = 8;
-int? episode = null;
+int? specificSeason = 8; // Leave as null to process all seasons
+int? episode = null; // Used for debugging specific episode
 var inputFolder = @$"G:\Video\{showName}";
 var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
 var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
