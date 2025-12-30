@@ -2,6 +2,8 @@
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.FileSystemGlobbing;
+using Nikse.SubtitleEdit.Core.BluRaySup;
+using Tesseract;
 using Whisper.net;
 using Whisper.net.Ggml;
 using Whisper.net.Logger;
@@ -11,16 +13,17 @@ using Whisper.net.Logger;
 // TODO: Find all seasons in the input folder
 // TODO: Add some parallelism to speed up processing
 
-var showName = "The Big Bang Theory";
-int? specificSeason = null;
+var showName = "Brooklyn Nine-Nine";
+int? specificSeason = 8;
 int? episode = null;
 var inputFolder = @$"G:\Video\{showName}";
 var cacheDir = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".mkvmatchr");
 var subtitlesFolder = Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), $".subtitlr", showName);
 var ffmpegPath = FindFfmpegPath() ?? throw new InvalidOperationException("ffmpeg not found on the PATH. Ensure ffmpeg is on the PATH and run again.");
+var tessdataPath = Path.Join(cacheDir, "tessdata");
 
-var whatIf = false;
-var ggmlType = GgmlType.LargeV3Turbo;
+var whatIf = args.Contains("--dry-run", StringComparer.OrdinalIgnoreCase);
+var ggmlType = GgmlType.LargeV2;
 var chunkLength = TimeSpan.FromMinutes(5);
 var sampleChunks = 3;
 
@@ -38,8 +41,21 @@ if (!Directory.Exists(subtitlesFolder))
     return;
 }
 
-using var whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
-using var whisperFactory = await InitializeWhisper(cacheDir, ggmlType);
+// Ensure Tesseract data is available for PGS subtitle OCR
+await EnsureTessdataExists(tessdataPath);
+
+// Lazy-load Whisper only if audio transcription fallback is needed
+WhisperFactory? whisperFactory = null;
+IDisposable? whisperLogger = null;
+async Task<WhisperFactory> GetWhisperFactory()
+{
+    if (whisperFactory is null)
+    {
+        whisperLogger = LogProvider.AddConsoleLogging(WhisperLogLevel.Info);
+        whisperFactory = await InitializeWhisper(cacheDir, ggmlType);
+    }
+    return whisperFactory;
+}
 
 var subtitles = LoadSubtitles(showName, subtitlesFolder, chunkLength, sampleChunks);
 
@@ -62,6 +78,10 @@ foreach (var season in mkvFiles.Keys)
     //    await ProcessFile(filePath, season);
     //}
 }
+
+// Dispose Whisper factory and logger if they were initialized
+whisperFactory?.Dispose();
+whisperLogger?.Dispose();
 
 Dictionary<int, List<string>> GetMkvFiles(string inputFolder)
 {
@@ -94,6 +114,269 @@ async Task ProcessFile(string filePath, int season)
 
     WriteLine($"{fileName}: Processing file {filePath}");
 
+    // First, try to extract embedded subtitles from the MKV file
+    var embeddedTextSubtitlePath = Path.ChangeExtension(filePath, ".embedded.srt");
+    var embeddedSupPath = Path.ChangeExtension(filePath, ".embedded.sup");
+    var (hasTextSubs, hasImageSubs, imageFormat) = TryExtractEmbeddedSubtitles(ffmpegPath, filePath, embeddedTextSubtitlePath, embeddedSupPath);
+
+    try
+    {
+        // Priority 1: Use text-based embedded subtitles (SRT, ASS, etc.)
+        if (hasTextSubs)
+        {
+            WriteLine($"{fileName}: Found text-based embedded subtitles, using them for matching.", ConsoleColor.Cyan);
+
+            if (await TryMatchWithTextSubtitles(filePath, season, fileName, embeddedTextSubtitlePath))
+            {
+                return;
+            }
+
+            WriteLine($"{fileName}: Text-based embedded subtitles did not produce a match.", ConsoleColor.Yellow);
+        }
+
+        // Priority 2: Use image-based embedded subtitles with OCR (PGS, etc.)
+        if (hasImageSubs)
+        {
+            WriteLine($"{fileName}: Found image-based subtitles ({imageFormat}), using OCR for matching.", ConsoleColor.Cyan);
+
+            if (await TryMatchWithOcrSubtitles(filePath, season, fileName, embeddedSupPath))
+            {
+                return;
+            }
+
+            WriteLine($"{fileName}: OCR-based matching did not produce a match.", ConsoleColor.Yellow);
+        }
+
+        // Priority 3: Fallback to audio transcription
+        if (!hasTextSubs && !hasImageSubs)
+        {
+            WriteLine($"{fileName}: No embedded subtitles found, using audio transcription.", ConsoleColor.Yellow);
+        }
+        else
+        {
+            WriteLine($"{fileName}: Falling back to audio transcription.", ConsoleColor.Yellow);
+        }
+
+        await ProcessFileWithAudioTranscription(filePath, season, fileName);
+    }
+    finally
+    {
+        // Clean up extracted subtitle files
+        if (File.Exists(embeddedTextSubtitlePath))
+        {
+            File.Delete(embeddedTextSubtitlePath);
+        }
+        if (File.Exists(embeddedSupPath))
+        {
+            File.Delete(embeddedSupPath);
+        }
+    }
+}
+
+async Task<bool> TryMatchWithTextSubtitles(string filePath, int season, string fileName, string subtitlePath)
+{
+    for (var i = 0; i < sampleChunks; i++)
+    {
+        var chunk = i + 1;
+        var sampleLength = chunkLength * chunk;
+
+        // Get text from embedded subtitles
+        var embeddedText = GetSubtitlesText(subtitlePath, TimeSpan.Zero, sampleLength);
+
+        // Match embedded subtitles with downloaded subtitle files
+        var bestMatch = FindBestMatchingSubtitle(filePath, showName, season, embeddedText, subtitles[season], chunk);
+
+        if (bestMatch is not null)
+        {
+            RenameFile(showName, season, inputFolder, filePath, bestMatch);
+            return true;
+        }
+
+        if (i < sampleChunks - 1)
+        {
+            WriteLine($"{fileName}: No matching subtitle found, increasing sample size to {chunkLength * (chunk + 1)}.", ConsoleColor.Blue);
+        }
+    }
+
+    return false;
+}
+
+async Task<bool> TryMatchWithOcrSubtitles(string filePath, int season, string fileName, string supPath)
+{
+    try
+    {
+        // Parse the SUP file using libse
+        var log = new StringBuilder();
+        var pgsSubtitles = BluRaySupParser.ParseBluRaySup(supPath, log);
+
+        if (pgsSubtitles.Count == 0)
+        {
+            WriteLine($"{fileName}: No PGS subtitles found in the extracted file.", ConsoleColor.Yellow);
+            return false;
+        }
+
+        WriteLine($"{fileName}: Found {pgsSubtitles.Count} PGS subtitle frames, performing OCR...", ConsoleColor.Gray);
+
+        // OCR the subtitle images
+        var ocrText = await OcrPgsSubtitles(pgsSubtitles, fileName, chunkLength * sampleChunks);
+
+        if (string.IsNullOrWhiteSpace(ocrText))
+        {
+            WriteLine($"{fileName}: OCR produced no text.", ConsoleColor.Yellow);
+            return false;
+        }
+
+        // Try matching with different chunk sizes
+        for (var i = 0; i < sampleChunks; i++)
+        {
+            var chunk = i + 1;
+            var sampleLength = chunkLength * chunk;
+
+            // Get OCR text up to the sample length
+            var ocrTextForDuration = GetOcrTextForDuration(pgsSubtitles, ocrText, sampleLength);
+
+            // Match OCR'd subtitles with downloaded subtitle files (using lower threshold for OCR)
+            var bestMatch = FindBestMatchingSubtitle(filePath, showName, season, ocrTextForDuration, subtitles[season], chunk, isOcrText: true);
+
+            if (bestMatch is not null)
+            {
+                RenameFile(showName, season, inputFolder, filePath, bestMatch);
+                return true;
+            }
+
+            if (i < sampleChunks - 1)
+            {
+                WriteLine($"{fileName}: No matching subtitle found, increasing sample size to {chunkLength * (chunk + 1)}.", ConsoleColor.Blue);
+            }
+        }
+
+        return false;
+    }
+    catch (Exception ex)
+    {
+        WriteLine($"{fileName}: Error during OCR processing: {ex.Message}", ConsoleColor.Red);
+        return false;
+    }
+}
+
+async Task<string> OcrPgsSubtitles(List<BluRaySupParser.PcsData> pgsSubtitles, string fileName, TimeSpan maxDuration)
+{
+    // Filter subtitles within duration and prepare for parallel processing
+    var subtitlesToProcess = pgsSubtitles
+        .Where(s => s.StartTimeCode.TotalMilliseconds <= maxDuration.TotalMilliseconds)
+        .ToList();
+
+    if (subtitlesToProcess.Count == 0)
+    {
+        return string.Empty;
+    }
+
+    // Step 1: Extract all bitmaps to PNG bytes in parallel (this is CPU-bound and thread-safe)
+    var bitmapTasks = subtitlesToProcess
+        .Select((subtitle, index) => Task.Run(() =>
+        {
+            try
+            {
+                using var bitmap = subtitle.GetBitmap();
+                if (bitmap.Width <= 1 || bitmap.Height <= 1)
+                {
+                    return (Index: index, PngBytes: (byte[]?)null);
+                }
+
+                using var ms = new MemoryStream();
+                bitmap.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                return (Index: index, PngBytes: (byte[]?)ms.ToArray());
+            }
+            catch
+            {
+                return (Index: index, PngBytes: (byte[]?)null);
+            }
+        }))
+        .ToList();
+
+    var bitmapResults = await Task.WhenAll(bitmapTasks);
+    var validBitmaps = bitmapResults
+        .Where(r => r.PngBytes is not null)
+        .OrderBy(r => r.Index)
+        .ToList();
+
+    if (validBitmaps.Count == 0)
+    {
+        return string.Empty;
+    }
+
+    // Step 2: OCR the bitmaps in parallel using multiple Tesseract engines
+    var degreeOfParallelism = Math.Min(Environment.ProcessorCount, validBitmaps.Count);
+    var results = new string?[validBitmaps.Count];
+
+    try
+    {
+        await Parallel.ForEachAsync(
+            validBitmaps.Select((b, i) => (Bitmap: b, ResultIndex: i)),
+            new ParallelOptions { MaxDegreeOfParallelism = degreeOfParallelism },
+            async (item, ct) =>
+            {
+                // Each parallel task gets its own Tesseract engine (engines are not thread-safe)
+                using var engine = new TesseractEngine(tessdataPath, "eng", EngineMode.Default);
+                // Suppress "Empty page!!" and other debug messages
+                engine.SetVariable("debug_file", OperatingSystem.IsWindows() ? "NUL" : "/dev/null");
+                try
+                {
+                    using var pix = Pix.LoadFromMemory(item.Bitmap.PngBytes!);
+                    using var page = engine.Process(pix);
+                    var text = page.GetText()?.Trim();
+                    results[item.ResultIndex] = string.IsNullOrWhiteSpace(text) ? null : text;
+                }
+                catch
+                {
+                    results[item.ResultIndex] = null;
+                }
+                await Task.CompletedTask; // Satisfy async signature
+            });
+    }
+    catch (Exception ex)
+    {
+        WriteLine($"{fileName}: Tesseract OCR failed: {ex.Message}", ConsoleColor.Red);
+        WriteLine($"{fileName}: Make sure Tesseract language data is available at: {tessdataPath}", ConsoleColor.Yellow);
+        return string.Empty;
+    }
+
+    // Combine results in order
+    var sb = new StringBuilder();
+    var processedCount = 0;
+    foreach (var text in results)
+    {
+        if (text is not null)
+        {
+            sb.AppendLine(text);
+            processedCount++;
+        }
+    }
+
+    WriteLine($"{fileName}: OCR completed, processed {processedCount} subtitle frames.", ConsoleColor.Gray);
+    return sb.ToString();
+}
+
+static string GetOcrTextForDuration(List<BluRaySupParser.PcsData> pgsSubtitles, string fullOcrText, TimeSpan duration)
+{
+    // Count how many subtitles fall within the duration
+    var count = pgsSubtitles.Count(s => s.StartTimeCode.TotalMilliseconds <= duration.TotalMilliseconds);
+    
+    // Split the full OCR text by lines and take approximately the right proportion
+    var lines = fullOcrText.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+    var totalSubtitles = pgsSubtitles.Count;
+    
+    if (totalSubtitles == 0 || count == 0)
+    {
+        return string.Empty;
+    }
+
+    var linesToTake = (int)Math.Ceiling((double)lines.Length * count / totalSubtitles);
+    return string.Join(Environment.NewLine, lines.Take(linesToTake));
+}
+
+async Task ProcessFileWithAudioTranscription(string filePath, int season, string fileName)
+{
     for (var i = 0; i < sampleChunks; i++)
     {
         var chunk = i + 1;
@@ -108,6 +391,11 @@ async Task ProcessFile(string filePath, int season)
 
             // Step 2: Transcribe audio to text using Whisper
             var transcription = await TranscribeAudio(audioPath, season);
+            // Save transcription to a file for debugging
+            var transcriptionsDir = Path.Combine(Path.GetDirectoryName(filePath) ?? string.Empty, "transcriptions");
+            Directory.CreateDirectory(transcriptionsDir);
+            var transcriptionPath = Path.Combine(transcriptionsDir, Path.ChangeExtension(Path.GetFileName(filePath), ".txt"));
+            await File.WriteAllTextAsync(transcriptionPath, transcription);
 
             // Step 3: Match transcription with subtitle files
             var bestMatch = FindBestMatchingSubtitle(filePath, showName, season, transcription, subtitles[season], chunk);
@@ -206,6 +494,190 @@ static void ExtractAudio(string ffmpegPath, string inputFile, string outputAudio
     WriteLine($"{fileName}: Audio extraction complete.");
 }
 
+static (bool HasTextSubs, bool HasImageSubs, string? ImageFormat) TryExtractEmbeddedSubtitles(string ffmpegPath, string inputFile, string outputTextSubtitle, string outputSupFile)
+{
+    var fileName = Path.GetFileName(inputFile);
+    WriteLine($"{fileName}: Checking for embedded subtitles ...");
+
+    // First, probe the file to find subtitle streams
+    var (textStreamIndex, imageStreamIndex, imageFormat) = FindSubtitleStreamIndices(ffmpegPath, inputFile);
+
+    var hasTextSubs = false;
+    var hasImageSubs = false;
+
+    // Try to extract text-based subtitles first (no codec copy needed, ffmpeg can convert to SRT)
+    if (textStreamIndex is not null)
+    {
+        hasTextSubs = ExtractSubtitleStream(ffmpegPath, inputFile, outputTextSubtitle, textStreamIndex.Value, fileName, copyCodec: false);
+    }
+
+    // Extract image-based subtitles with codec copy (PGS/SUP cannot be re-encoded)
+    if (imageStreamIndex is not null)
+    {
+        hasImageSubs = ExtractSubtitleStream(ffmpegPath, inputFile, outputSupFile, imageStreamIndex.Value, fileName, copyCodec: true);
+    }
+
+    if (!hasTextSubs && !hasImageSubs)
+    {
+        WriteLine($"{fileName}: No suitable subtitle stream found.");
+    }
+
+    return (hasTextSubs, hasImageSubs, imageFormat);
+}
+
+static bool ExtractSubtitleStream(string ffmpegPath, string inputFile, string outputFile, int streamIndex, string fileName, bool copyCodec = false)
+{
+    WriteLine($"{fileName}: Extracting embedded subtitle stream {streamIndex} to {Path.GetFileName(outputFile)} ...");
+
+    // Use -c:s copy for image-based subtitles (SUP/PGS) to avoid re-encoding
+    var codecArg = copyCodec ? "-c:s copy" : "";
+    
+    var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = ffmpegPath,
+            Arguments = $"-i \"{inputFile}\" -y -map 0:{streamIndex} {codecArg} \"{outputFile}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }
+    };
+
+    var outputBuilder = new StringBuilder();
+    var errorBuilder = new StringBuilder();
+
+    process.OutputDataReceived += (sender, args) => outputBuilder.AppendLine(args.Data);
+    process.ErrorDataReceived += (sender, args) => errorBuilder.AppendLine(args.Data);
+
+    process.Start();
+    process.BeginOutputReadLine();
+    process.BeginErrorReadLine();
+
+    if (!process.WaitForExit(TimeSpan.FromSeconds(60)))
+    {
+        process.Kill();
+        WriteLine($"{fileName}: Subtitle extraction timed out.", ConsoleColor.Yellow);
+        return false;
+    }
+
+    if (process.ExitCode != 0)
+    {
+        WriteLine($"{fileName}: Failed to extract subtitles: {errorBuilder}", ConsoleColor.Yellow);
+        return false;
+    }
+
+    // Verify the output file exists and has content
+    if (!File.Exists(outputFile) || new FileInfo(outputFile).Length == 0)
+    {
+        WriteLine($"{fileName}: Extracted subtitle file is empty or doesn't exist.", ConsoleColor.Yellow);
+        return false;
+    }
+
+    WriteLine($"{fileName}: Subtitle extraction complete.");
+    return true;
+}
+
+static (int? TextStreamIndex, int? ImageStreamIndex, string? ImageFormat) FindSubtitleStreamIndices(string ffmpegPath, string inputFile)
+{
+    var fileName = Path.GetFileName(inputFile);
+
+    // Use ffprobe (or ffmpeg with -i) to find subtitle streams
+    // We prefer text-based subtitles (subrip/srt, ass, ssa) over image-based ones (dvdsub, pgs)
+    var process = new Process
+    {
+        StartInfo = new ProcessStartInfo
+        {
+            FileName = ffmpegPath,
+            Arguments = $"-i \"{inputFile}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        }
+    };
+
+    var errorBuilder = new StringBuilder();
+    process.ErrorDataReceived += (sender, args) => errorBuilder.AppendLine(args.Data);
+
+    process.Start();
+    process.BeginErrorReadLine();
+    process.WaitForExit(TimeSpan.FromSeconds(10));
+
+    var output = errorBuilder.ToString();
+
+    // Parse ffmpeg output to find subtitle streams
+    // Example: Stream #0:2(eng): Subtitle: subrip
+    // We prefer English subtitles and text-based formats
+    var textBasedFormats = new[] { "subrip", "srt", "ass", "ssa", "webvtt", "mov_text" };
+    var imagBasedFormats = new[] { "dvd", "pgs", "hdmv", "bitmap", "dvb", "xsub" };
+    var preferredLanguages = new[] { "eng", "en" };
+
+    int? bestTextStreamIndex = null;
+    int bestTextScore = -1;
+    int? bestImageStreamIndex = null;
+    int bestImageScore = -1;
+    string? bestImageFormat = null;
+
+    foreach (var line in output.Split('\n'))
+    {
+        var streamMatch = SubtitleStreamRegex().Match(line);
+        if (streamMatch.Success)
+        {
+            var streamIndex = int.Parse(streamMatch.Groups[1].Value);
+            var language = streamMatch.Groups[2].Value.ToLowerInvariant();
+            var format = streamMatch.Groups[3].Value.ToLowerInvariant();
+
+            // Check if image-based subtitle format
+            if (imagBasedFormats.Any(f => format.Contains(f)))
+            {
+                WriteLine($"{fileName}: Found image-based subtitle stream {streamIndex} ({format}).", ConsoleColor.Gray);
+                
+                // Calculate a score based on language preferences
+                var score = 0;
+                if (preferredLanguages.Any(l => language.Contains(l)))
+                {
+                    score += 5;
+                }
+
+                if (score > bestImageScore)
+                {
+                    bestImageScore = score;
+                    bestImageStreamIndex = streamIndex;
+                    bestImageFormat = format;
+                }
+                continue;
+            }
+
+            // Text-based subtitle
+            // Calculate a score based on format and language preferences
+            var textScore = 0;
+            if (textBasedFormats.Any(f => format.Contains(f)))
+            {
+                textScore += 10;
+            }
+            if (preferredLanguages.Any(l => language.Contains(l)))
+            {
+                textScore += 5;
+            }
+
+            if (textScore > bestTextScore)
+            {
+                bestTextScore = textScore;
+                bestTextStreamIndex = streamIndex;
+            }
+        }
+    }
+
+    if (bestTextStreamIndex is null && bestImageStreamIndex is null)
+    {
+        WriteLine($"{fileName}: No subtitle streams found.", ConsoleColor.Yellow);
+    }
+
+    return (bestTextStreamIndex, bestImageStreamIndex, bestImageFormat);
+}
+
 // TODO: Pass in the StringBuilder and pool them at the call site
 async Task<string> TranscribeAudio(string audioPath, int season)
 {
@@ -214,7 +686,8 @@ async Task<string> TranscribeAudio(string audioPath, int season)
 
     var sb = new StringBuilder();
 
-    var whisperBuilder = CreateWhisperBuilder(whisperFactory, showName, season);
+    var factory = await GetWhisperFactory();
+    var whisperBuilder = CreateWhisperBuilder(factory, showName, season);
     await using var processor = whisperBuilder.Build();
 
     using var fileStream = File.OpenRead(audioPath);
@@ -232,14 +705,53 @@ static async Task DownloadModel(string filePath, GgmlType ggmlType)
 {
     WriteLine($"Downloading model {Enum.GetName(ggmlType)} to {Path.GetFileName(filePath)}", ConsoleColor.Gray);
 
-    using var modelStream = await WhisperGgmlDownloader.GetGgmlModelAsync(ggmlType);
+    var downloader = new WhisperGgmlDownloader(new());
+    using var modelStream = await downloader.GetGgmlModelAsync(ggmlType);
     using var fileStream = File.OpenWrite(filePath);
     await modelStream.CopyToAsync(fileStream);
 }
 
-static string? FindBestMatchingSubtitle(string filePath, string showName, int season, string transcription, List<(string, string[])> subtitles, int chunk)
+static async Task EnsureTessdataExists(string tessdataPath)
+{
+    Directory.CreateDirectory(tessdataPath);
+    
+    var engTrainedData = Path.Join(tessdataPath, "eng.traineddata");
+    if (File.Exists(engTrainedData))
+    {
+        return;
+    }
+
+    WriteLine("Downloading Tesseract English language data for OCR...", ConsoleColor.Gray);
+    
+    // Download eng.traineddata from tessdata_fast repository
+    const string tessdataUrl = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata";
+    
+    using var httpClient = new HttpClient();
+    httpClient.Timeout = TimeSpan.FromMinutes(5);
+    
+    try
+    {
+        var response = await httpClient.GetAsync(tessdataUrl);
+        response.EnsureSuccessStatusCode();
+        
+        await using var fileStream = File.Create(engTrainedData);
+        await response.Content.CopyToAsync(fileStream);
+        
+        WriteLine("Tesseract language data downloaded successfully.", ConsoleColor.Green);
+    }
+    catch (Exception ex)
+    {
+        WriteLine($"Failed to download Tesseract language data: {ex.Message}", ConsoleColor.Red);
+        WriteLine($"Please manually download eng.traineddata from {tessdataUrl} to {tessdataPath}", ConsoleColor.Yellow);
+    }
+}
+
+static string? FindBestMatchingSubtitle(string filePath, string showName, int season, string transcription, List<(string, string[])> subtitles, int chunk, bool isOcrText = false)
 {
     WriteLine($"{Path.GetFileName(filePath)}: Finding best matching subtitle");
+
+    // Normalize the transcription/OCR text
+    var normalizedTranscription = NormalizeTextForMatching(transcription);
 
     string? bestMatch = null;
     double highestSimilarity = 0;
@@ -248,8 +760,9 @@ static string? FindBestMatchingSubtitle(string filePath, string showName, int se
     {
         var fileName = subtitle.Item1;
         var subtitleContent = string.Join(Environment.NewLine, subtitle.Item2.Take(chunk));
+        var normalizedSubtitle = NormalizeTextForMatching(subtitleContent);
 
-        var similarity = CalculateCosineSimilarity(transcription, subtitleContent);
+        var similarity = CalculateCosineSimilarity(normalizedTranscription, normalizedSubtitle);
         if (similarity > highestSimilarity)
         {
             highestSimilarity = similarity;
@@ -257,14 +770,46 @@ static string? FindBestMatchingSubtitle(string filePath, string showName, int se
         }
     }
 
-    if (highestSimilarity < 0.8)
+    // Use a lower threshold for OCR text since it inherently has more errors
+    var threshold = isOcrText ? 0.5 : 0.8;
+    
+    if (highestSimilarity < threshold)
     {
-        WriteLine($"{Path.GetFileName(filePath)}: No matching subtitle above 80% found (highest was {highestSimilarity:P2}).", ConsoleColor.Yellow);
+        WriteLine($"{Path.GetFileName(filePath)}: No matching subtitle above {threshold:P0} found (highest was {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}).", ConsoleColor.Yellow);
         return null;
     }
 
     WriteLine($"{Path.GetFileName(filePath)}: Match found! Best match is {Path.GetFileName(bestMatch)} with similarity of {highestSimilarity:P2}.", ConsoleColor.Green);
     return bestMatch;
+}
+
+static string NormalizeTextForMatching(string text)
+{
+    if (string.IsNullOrWhiteSpace(text))
+    {
+        return string.Empty;
+    }
+
+    var sb = new StringBuilder(text.Length);
+    
+    foreach (var c in text)
+    {
+        if (char.IsLetterOrDigit(c))
+        {
+            sb.Append(char.ToLowerInvariant(c));
+        }
+        else if (char.IsWhiteSpace(c) || c == '\n' || c == '\r')
+        {
+            // Normalize all whitespace to single space
+            if (sb.Length > 0 && sb[^1] != ' ')
+            {
+                sb.Append(' ');
+            }
+        }
+        // Skip punctuation and other characters
+    }
+
+    return sb.ToString().Trim();
 }
 
 static Dictionary<int, List<(string, string[])>> LoadSubtitles(string showName, string subtitlesFolder, TimeSpan duration, int chunkCount)
@@ -422,6 +967,13 @@ static double CalculateCosineSimilarity(string text1, string text2)
             foreach (var splitWord in word.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries))
             {
                 var key = splitWord.ToLowerInvariant();
+                
+                // Skip very short words (likely OCR artifacts or noise)
+                if (key.Length < 2)
+                {
+                    continue;
+                }
+                
                 // TODO: Use span-based alternate dictionary lookup
                 if (wordCounts.TryGetValue(key, out var count))
                 {
@@ -506,7 +1058,7 @@ static WhisperProcessorBuilder CreateWhisperBuilder(WhisperFactory whisperFactor
 {
     var whisperBuilder = whisperFactory.CreateBuilder()
         .WithLanguage("en")
-        .WithPrompt($"This is an episode from season {season} of the TV series '{showName}'")
+        .WithPrompt($"This is a fragment of the audio track from an episode of the TV series '{showName}' in season {season}")
         .WithThreads(4);
 
     return whisperBuilder;
@@ -524,6 +1076,11 @@ partial class Program
 
     [GeneratedRegex(@"\d+\r?\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}\r?\n")]
     public static partial Regex SrtTimeStamp();
+
+    // Matches ffmpeg stream output like: Stream #0:2(eng): Subtitle: subrip
+    // Group 1: stream index, Group 2: language (optional), Group 3: subtitle format
+    [GeneratedRegex(@"Stream #0:(\d+)(?:\(([a-z]{2,3})\))?:\s*Subtitle:\s*(\w+)", RegexOptions.IgnoreCase, "en-US")]
+    public static partial Regex SubtitleStreamRegex();
 
     [GeneratedRegex(@"<[^>]+>")]
     public static partial Regex HtmlTags();

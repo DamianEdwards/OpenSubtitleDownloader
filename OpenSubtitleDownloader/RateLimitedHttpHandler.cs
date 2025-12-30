@@ -1,6 +1,7 @@
 ﻿using System.Threading.RateLimiting;
 
 namespace OpenSubtitleDownloader;
+
 internal sealed class RateLimitedHttpHandler(RateLimiter limiter)
     : DelegatingHandler(new HttpClientHandler()), IAsyncDisposable
 {

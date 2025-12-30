@@ -45,8 +45,8 @@ var login = await service.LoginAsync(new() { Username = username, Password = pas
 
 var featureSearch = new NewFeatureSearch
 {
-    Query = "Mayday",
-    Year = 2003
+    Query = "Brooklyn Nine-Nine",
+    Year = 2013
 };
 
 var featureResult = await service.SearchFeaturesAsync(featureSearch);
